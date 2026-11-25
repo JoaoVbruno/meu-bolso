@@ -25,7 +25,7 @@ const chunk = (type, data) => {
   return Buffer.concat([len, td, crc]);
 };
 
-function icon(size, { maskable }) {
+function icon(size, { maskable, noBg = false, onlyBg = false }) {
   const px = Buffer.alloc(size * size * 4);
   const bg = [15, 118, 110], fg = [255, 255, 255], accent = [250, 204, 21];
   const r = maskable ? 0 : size * 0.22; // cantos arredondados só no ícone normal
@@ -41,10 +41,13 @@ function icon(size, { maskable }) {
   for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
     const i = (y * size + x) * 4;
     if (!inRounded(x, y)) { px[i + 3] = 0; continue; }
-    let c = bg;
+    let c = noBg ? null : bg;
     const u = (x - ox) / s, v = (y - oy) / s;
-    for (const [bx, top] of bars) if (u >= bx && u <= bx + bw && v >= top && v <= 1) c = fg;
-    if ((x - coin.x) ** 2 + (y - coin.y) ** 2 <= coin.rr ** 2) c = accent;
+    if (!onlyBg) {
+      for (const [bx, top] of bars) if (u >= bx && u <= bx + bw && v >= top && v <= 1) c = fg;
+      if ((x - coin.x) ** 2 + (y - coin.y) ** 2 <= coin.rr ** 2) c = accent;
+    }
+    if (!c) { px[i + 3] = 0; continue; }
     px[i] = c[0]; px[i + 1] = c[1]; px[i + 2] = c[2]; px[i + 3] = 255;
   }
   const raw = Buffer.alloc(size * (size * 4 + 1));
@@ -61,4 +64,9 @@ function icon(size, { maskable }) {
 writeFileSync(join(root, 'icons/icon-192.png'), icon(192, { maskable: false }));
 writeFileSync(join(root, 'icons/icon-512.png'), icon(512, { maskable: false }));
 writeFileSync(join(root, 'icons/maskable-512.png'), icon(512, { maskable: true }));
-console.log('ícones gerados em icons/');
+// Fontes para o ícone do APK (@capacitor/assets).
+mkdirSync(join(root, 'assets'), { recursive: true });
+writeFileSync(join(root, 'assets/icon-only.png'), icon(1024, { maskable: true }));
+writeFileSync(join(root, 'assets/icon-foreground.png'), icon(1024, { maskable: true, noBg: true }));
+writeFileSync(join(root, 'assets/icon-background.png'), icon(1024, { maskable: true, onlyBg: true }));
+console.log('ícones gerados em icons/ e assets/');

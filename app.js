@@ -433,6 +433,8 @@ function render() {
   $$('.tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === UI.tab));
   const fn = { home: renderHome, bills: renderBills, advisor: renderAdvisor, plans: renderPlans, forecast: renderForecast, tx: renderTx }[UI.tab];
   view().innerHTML = fn();
+  $$('form', view()).forEach(restoreDraft);
+  saveUI();
   window.scrollTo(0, 0);
 }
 const monthBar = (key) => `
@@ -874,10 +876,57 @@ function applyTheme() {
   else document.documentElement.setAttribute('data-theme', t);
 }
 
+/* ---------- rascunhos: salva tudo que está sendo digitado ---------- */
+// Cada formulário é salvo a cada tecla. Se o app fechar no meio, ao abrir de novo
+// ele volta para o mesmo formulário com o que já tinha sido preenchido.
+const DRAFT_KEY = 'meu-bolso-rascunhos';
+const UI_KEY = 'meu-bolso-ui';
+let modalRef = null; // qual formulário está aberto no modal, para reabrir depois
+
+function readDrafts() { try { return JSON.parse(localStorage.getItem(DRAFT_KEY)) || {}; } catch { return {}; } }
+function writeDrafts(all) { try { localStorage.setItem(DRAFT_KEY, JSON.stringify(all)); } catch { /* sem armazenamento */ } }
+const draftKey = (form) => `${form.id}|${form.dataset.id || ''}`;
+
+function saveDraft(form) {
+  if (!form?.id) return;
+  const d = formData(form);
+  $$('[data-seg]', form).forEach((s) => { d[`seg:${s.dataset.seg}`] = segValue(form, s.dataset.seg); });
+  const all = readDrafts();
+  all[draftKey(form)] = { d, at: Date.now(), reopen: form.closest('dialog') ? modalRef : null };
+  writeDrafts(all);
+}
+function restoreDraft(form) {
+  const dr = form && readDrafts()[draftKey(form)];
+  if (!dr) return;
+  for (const [k, v] of Object.entries(dr.d)) {
+    if (k.startsWith('seg:')) { const btn = $(`[data-seg="${k.slice(4)}"] [data-v="${v}"]`, form); if (btn) setSeg(btn); continue; }
+    const el = form.elements[k];
+    if (el && el.type !== 'file') el.value = v;
+  }
+}
+function clearDraft(form) {
+  if (!form?.id) return;
+  const all = readDrafts(); delete all[draftKey(form)]; writeDrafts(all);
+}
+function saveUI() { try { localStorage.setItem(UI_KEY, JSON.stringify({ tab: UI.tab })); } catch { /* ok */ } }
+
 /* ---------- modal e avisos ---------- */
 const modal = () => $('#modal');
-function openModal(html) { $('#modal-body').innerHTML = html; if (!modal().open) modal().showModal(); }
-function closeModal() { if (modal().open) modal().close(); }
+function openModal(html, ref = null) {
+  modalRef = ref;
+  $('#modal-body').innerHTML = html;
+  restoreDraft($('#modal-body form'));
+  if (!modal().open) modal().showModal();
+}
+function closeModal() { if (modal().open) modal().close(); modalRef = null; }
+/** Reabre o formulário pelo descritor salvo no rascunho. */
+function reopenModal(ref) {
+  if (!ref) return;
+  if (ref.k === 'settings') openModal(settingsForm(), ref);
+  else if (ref.k === 'bill') { const f = ref.id && S.fixed.find((x) => x.id === ref.id); if (!ref.id || f) openModal(billForm(f), ref); }
+  else if (ref.k === 'goal') { const g = ref.id && S.goals.find((x) => x.id === ref.id); if (!ref.id || g) openModal(goalForm(g, ref.tpl), ref); }
+  else if (ref.k === 'tx') openModal(txForm(), ref);
+}
 function toast(msg) {
   const el = document.createElement('div');
   el.textContent = msg;
@@ -891,17 +940,23 @@ const segValue = (root, name) => $(`[data-seg="${name}"] .on`, root)?.dataset.v;
 /* ---------- eventos ---------- */
 let pendingImport = null;
 
+/** Liga um botão de um seletor (seg) e mostra/esconde as partes do formulário ligadas a ele. */
+function setSeg(btn) {
+  const seg = btn.parentElement; const name = seg.dataset.seg; const v = btn.dataset.v;
+  $$('button', seg).forEach((b) => b.classList.toggle('on', b === btn));
+  if (name === 'kind') $$('[data-kind]', seg.closest('form')).forEach((el) => { el.hidden = el.dataset.kind !== v; });
+  if (name === 'method') { UI.adv.method = v; $$('[data-show]').forEach((el) => { el.hidden = el.dataset.show !== v; }); }
+}
+
 document.addEventListener('click', (e) => {
   const tab = e.target.closest('.tabs button');
   if (tab) { UI.tab = tab.dataset.tab; render(); return; }
 
   const segBtn = e.target.closest('[data-seg] button');
   if (segBtn) {
-    const seg = segBtn.parentElement; const name = seg.dataset.seg; const v = segBtn.dataset.v;
-    $$('button', seg).forEach((b) => b.classList.toggle('on', b === segBtn));
-    if (name === 'kind') $$('[data-kind]', seg.closest('form')).forEach((el) => { el.hidden = el.dataset.kind !== v; });
-    if (name === 'method') { UI.adv.method = v; $$('[data-show]').forEach((el) => { el.hidden = el.dataset.show !== v; }); }
-    if (name === 'horizon') { UI.horizon = +v; render(); }
+    setSeg(segBtn);
+    if (segBtn.parentElement.dataset.seg === 'horizon') { UI.horizon = +segBtn.dataset.v; render(); }
+    saveDraft(segBtn.closest('form'));
     return;
   }
 
@@ -916,16 +971,16 @@ document.addEventListener('click', (e) => {
       const M = UI.month; S.paid[M] = S.paid[M] || {};
       S.paid[M][id] = el.checked; save(); break;
     }
-    case 'close': closeModal(); break;
-    case 'new-bill': openModal(billForm()); break;
-    case 'edit-bill': openModal(billForm(S.fixed.find((f) => f.id === id))); break;
+    case 'close': clearDraft($('#modal-body form')); closeModal(); break;
+    case 'new-bill': openModal(billForm(), { k: 'bill' }); break;
+    case 'edit-bill': openModal(billForm(S.fixed.find((f) => f.id === id)), { k: 'bill', id }); break;
     case 'del-bill': {
       const fid = $('#bill-form').dataset.id;
       if (confirm('Excluir esta conta fixa?')) { S.fixed = S.fixed.filter((f) => f.id !== fid); save(); closeModal(); render(); }
       break;
     }
-    case 'new-goal': openModal(goalForm(null, el.dataset.tpl)); break;
-    case 'edit-goal': openModal(goalForm(S.goals.find((g) => g.id === id))); break;
+    case 'new-goal': openModal(goalForm(null, el.dataset.tpl), { k: 'goal', tpl: el.dataset.tpl }); break;
+    case 'edit-goal': openModal(goalForm(S.goals.find((g) => g.id === id)), { k: 'goal', id }); break;
     case 'del-goal': {
       const gid = $('#goal-form').dataset.id;
       if (confirm('Excluir este plano?')) { S.goals = S.goals.filter((g) => g.id !== gid); save(); closeModal(); render(); }
@@ -939,7 +994,7 @@ document.addEventListener('click', (e) => {
         <div class="btns"><button class="btn" type="submit">Adicionar</button><button class="btn ghost" type="button" data-act="close">Cancelar</button></div></form>`);
       break;
     }
-    case 'new-tx': openModal(txForm()); break;
+    case 'new-tx': openModal(txForm(), { k: 'tx' }); break;
     case 'del-tx': if (confirm('Excluir este lançamento?')) { S.tx = S.tx.filter((t) => t.id !== id); save(); render(); } break;
     case 'import': $('#file-import').click(); break;
     case 'confirm-import': {
@@ -952,19 +1007,15 @@ document.addEventListener('click', (e) => {
     case 'register-buy': {
       const a = UI.adv;
       addPurchase({ desc: a.desc || 'Compra', value: a.value, method: a.method, parcels: a.parcels, cat: a.cat });
+      clearDraft($('#adv-form'));
       a.result = ''; a.value = undefined; a.desc = ''; render(); toast('Compra registrada.');
       break;
     }
     case 'use-avg': S.settings.varEssBudget = +el.dataset.v; save(); render(); toast('Orçamento de essenciais atualizado.'); break;
-    case 'backup': {
-      const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
-      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `meu-bolso-backup-${todayStr()}.json`; a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-      break;
-    }
+    case 'backup': exportBackup(); break;
     case 'restore': $('#file-backup').click(); break;
     case 'reset':
-      if (confirm('Apagar TODOS os dados deste aparelho? Não dá para desfazer.')) { S = structuredClone(DEFAULT); save(); closeModal(); render(); openModal(settingsForm()); }
+      if (confirm('Apagar TODOS os dados deste aparelho? Não dá para desfazer.')) { S = structuredClone(DEFAULT); save(); writeDrafts({}); closeModal(); render(); openModal(settingsForm(), { k: 'settings' }); }
       break;
     default: break;
   }
@@ -972,16 +1023,19 @@ document.addEventListener('click', (e) => {
 
 document.addEventListener('change', (e) => {
   const el = e.target;
+  if (el.form?.id) saveDraft(el.form);
   if (el.dataset.act === 'tx-cat') { const t = S.tx.find((x) => x.id === el.dataset.id); if (t) { t.cat = el.value; save(); } }
   if (el.dataset.act === 'share') { S.settings.lazerToPlans = +el.value; save(); render(); }
 });
 document.addEventListener('input', (e) => {
   if (e.target.dataset.act === 'share') $('#share-v').textContent = `${e.target.value}%`;
+  if (e.target.form?.id) saveDraft(e.target.form);
 });
 
 document.addEventListener('submit', (e) => {
   e.preventDefault();
   const form = e.target; const d = formData(form);
+  if (form.id !== 'adv-form') clearDraft(form); // salvo de verdade: o rascunho não é mais necessário
   switch (form.id) {
     case 'set-form': {
       const s = S.settings;
@@ -1081,9 +1135,32 @@ $('#file-backup').addEventListener('change', async (e) => {
   } catch { toast('Arquivo de backup inválido.'); }
 });
 
-$('#btn-settings').addEventListener('click', () => openModal(settingsForm()));
+$('#btn-settings').addEventListener('click', () => openModal(settingsForm(), { k: 'settings' }));
 modal().addEventListener('click', (e) => { if (e.target === modal() && S.settings.setupDone) closeModal(); });
 modal().addEventListener('cancel', (e) => { if (!S.settings.setupDone) e.preventDefault(); });
+
+/* ---------- backup ---------- */
+const NATIVE = !!window.Capacitor?.isNativePlatform?.();
+/** No app Android: grava o arquivo e abre o "Compartilhar" (Drive, WhatsApp, e-mail). No navegador: baixa o arquivo. */
+async function exportBackup() {
+  const name = `meu-bolso-backup-${todayStr()}.json`;
+  const json = JSON.stringify(S, null, 2);
+  const P = window.Capacitor?.Plugins || {};
+  if (NATIVE && P.Filesystem && P.Share) {
+    try {
+      const { uri } = await P.Filesystem.writeFile({ path: name, data: json, directory: 'CACHE', encoding: 'utf8' });
+      await P.Share.share({ title: 'Backup Meu Bolso', files: [uri] });
+      return;
+    } catch (err) {
+      if (/cancel/i.test(String(err?.message))) return;
+      toast('Não consegui compartilhar o backup.');
+      return;
+    }
+  }
+  const blob = new Blob([json], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
 
 /* ---------- instalação (PWA) ---------- */
 let installEvt = null;
@@ -1092,12 +1169,19 @@ $('#btn-install').addEventListener('click', async () => {
   if (!installEvt) return;
   installEvt.prompt(); await installEvt.userChoice; installEvt = null; $('#btn-install').hidden = true;
 });
-if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+// No APK os arquivos já estão dentro do app: o service worker só é usado na versão web.
+if (!NATIVE && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 navigator.storage?.persist?.().catch(() => {});
 
 /* ---------- início ---------- */
 applyTheme();
+try { const u = JSON.parse(localStorage.getItem(UI_KEY)); if (u?.tab) UI.tab = u.tab; } catch { /* ok */ }
 render();
-if (!S.settings.setupDone) openModal(settingsForm());
+if (!S.settings.setupDone) openModal(settingsForm(), { k: 'settings' });
+else {
+  // Reabre o último formulário que ficou pela metade.
+  const last = Object.values(readDrafts()).filter((x) => x.reopen).sort((a, b) => b.at - a.at)[0];
+  if (last) { reopenModal(last.reopen); toast('Recuperei o que você estava preenchendo.'); }
+}

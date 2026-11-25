@@ -1,6 +1,6 @@
 // Service worker: guarda o app no celular para abrir sem internet.
 // Ao mudar qualquer arquivo do app, suba a versão abaixo.
-const CACHE = 'meu-bolso-v1';
+const CACHE = 'meu-bolso-v2';
 const ASSETS = [
   './', './index.html', './styles.css', './app.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png',
