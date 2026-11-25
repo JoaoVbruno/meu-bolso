@@ -33,7 +33,7 @@ jobs:
         run: |
           npm run build:web
           npx cap add android
-          npx capacitor-assets generate --android --iconBackgroundColor '#0f766e' --iconBackgroundColorDark '#0f766e' --splashBackgroundColor '#0f766e' --splashBackgroundColorDark '#0b1414'
+          node tools/make-icons.mjs --android
           npx cap sync android
           # Cada build ganha um número de versão maior, para instalar por cima da anterior.
           sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle

@@ -64,9 +64,22 @@ function icon(size, { maskable, noBg = false, onlyBg = false }) {
 writeFileSync(join(root, 'icons/icon-192.png'), icon(192, { maskable: false }));
 writeFileSync(join(root, 'icons/icon-512.png'), icon(512, { maskable: false }));
 writeFileSync(join(root, 'icons/maskable-512.png'), icon(512, { maskable: true }));
-// Fontes para o ícone do APK (@capacitor/assets).
-mkdirSync(join(root, 'assets'), { recursive: true });
-writeFileSync(join(root, 'assets/icon-only.png'), icon(1024, { maskable: true }));
-writeFileSync(join(root, 'assets/icon-foreground.png'), icon(1024, { maskable: true, noBg: true }));
-writeFileSync(join(root, 'assets/icon-background.png'), icon(1024, { maskable: true, onlyBg: true }));
-console.log('ícones gerados em icons/ e assets/');
+console.log('ícones gerados em icons/');
+
+// Com --android: grava os ícones do APK no projeto gerado pelo Capacitor (android/).
+if (process.argv.includes('--android')) {
+  const res = join(root, 'android/app/src/main/res');
+  const dens = { mdpi: 1, hdpi: 1.5, xhdpi: 2, xxhdpi: 3, xxxhdpi: 4 };
+  for (const [d, k] of Object.entries(dens)) {
+    const dir = join(res, `mipmap-${d}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'ic_launcher.png'), icon(Math.round(48 * k), { maskable: false }));
+    writeFileSync(join(dir, 'ic_launcher_round.png'), icon(Math.round(48 * k), { maskable: false }));
+    // Ícone adaptativo: camada da frente sem fundo, 108dp.
+    writeFileSync(join(dir, 'ic_launcher_foreground.png'), icon(Math.round(108 * k), { maskable: true, noBg: true }));
+  }
+  mkdirSync(join(res, 'values'), { recursive: true });
+  writeFileSync(join(res, 'values/ic_launcher_background.xml'),
+    '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#0F766E</color>\n</resources>\n');
+  console.log('ícones do Android gravados em android/app/src/main/res');
+}

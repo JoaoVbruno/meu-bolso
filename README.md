@@ -3,9 +3,33 @@
 App (PWA) para Android: contas fixas, quanto sobra para lazer, consultor de compras, planos e previsão.
 Os dados ficam só no celular. Não há servidor nem login.
 
-## Colocar no celular
+## Instalar o APK no Android
 
-O Android só instala o app a partir de um endereço `https://`. Escolha uma opção:
+1. No celular, abra https://github.com/JoaoVbruno/meu-bolso/releases/latest/download/meu-bolso.apk
+2. Abra o arquivo baixado. Na primeira vez, o Android pede para permitir instalar apps desta fonte (Chrome ou Arquivos): permita.
+3. Toque em **Instalar**. Se aparecer o aviso do Play Protect, toque em **Mais detalhes → Instalar mesmo assim**.
+
+Atualizações instalam por cima e mantêm os dados, desde que o APK seja assinado com a mesma chave.
+
+### Gerar o APK neste PC
+
+Requisitos: Node, Java 17 e Android SDK (platform 34, build-tools 34.0.0).
+
+```
+npm install
+npm run build:web
+npx cap add android          # só na primeira vez
+node tools/make-icons.mjs --android
+npx cap sync android
+cd android && gradlew.bat assembleRelease
+```
+
+Depois alinhe e assine `android/app/build/outputs/apk/release/app-release-unsigned.apk` com `zipalign` e `apksigner`, usando a chave em `chave-android/` (fora do repositório).
+Antes de cada versão nova, aumente `versionCode` em `android/app/build.gradle`.
+
+## Versão web (PWA)
+
+O Android só instala a versão web a partir de um endereço `https://`. Escolha uma opção:
 
 **Netlify Drop (mais simples, grátis)**
 1. Abra https://app.netlify.com/drop no computador e crie uma conta.
