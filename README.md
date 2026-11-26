@@ -10,6 +10,8 @@ Os dados ficam só no celular. Não há servidor nem login.
 3. Toque em **Instalar**. Se aparecer o aviso do Play Protect, toque em **Mais detalhes → Instalar mesmo assim**.
 
 Atualizações instalam por cima e mantêm os dados, desde que o APK seja assinado com a mesma chave.
+A partir da 1.0.2, o próprio app avisa quando há versão nova (Início ou Configurações → Versão) e baixa e abre o instalador.
+O número da release (`v1.0.N`) precisa ser igual ao `versionCode` N do `android/app/build.gradle`.
 
 ### Gerar o APK neste PC
 

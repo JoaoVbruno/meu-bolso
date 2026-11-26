@@ -32,11 +32,9 @@ jobs:
       - name: Montar o projeto Android
         run: |
           npm run build:web
-          npx cap add android
           node tools/make-icons.mjs --android
           npx cap sync android
-          # Cada build ganha um número de versão maior, para instalar por cima da anterior.
-          sed -i "s/versionCode 1$/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"1.0.${{ github.run_number }}\"/" android/app/build.gradle
+          # A versão vem de android/app/build.gradle: suba versionCode e versionName a cada release.
           grep -E "versionCode|versionName" android/app/build.gradle
 
       - name: Compilar
@@ -60,6 +58,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v1.0.${{ github.run_number }}" meu-bolso.apk \
-            --title "Meu Bolso 1.0.${{ github.run_number }}" \
+          V=$(grep -oP 'versionName "\K[^"]+' android/app/build.gradle)
+          gh release create "v$V" meu-bolso.apk \
+            --title "Meu Bolso $V" \
             --notes "Baixe meu-bolso.apk no celular Android e instale. Instala por cima da versão anterior sem perder dados."

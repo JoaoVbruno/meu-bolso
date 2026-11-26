@@ -87,11 +87,15 @@ const DEFAULT = {
   settings: {
     income: 0, payDay: 5, savingsPct: 10, varEssBudget: 0,
     cardClose: 3, cardDue: 10, cardLimit: 0, lazerToPlans: 30, theme: 'auto', setupDone: false,
+    notify: true, lock: false, aiKey: '',
   },
-  fixed: [], // contas fixas: mensal | anual | parcelado
-  paid: {},  // { 'AAAA-MM': { idDaConta: true } }
-  tx: [],    // lançamentos (gastos)
-  goals: [], // planos
+  fixed: [],   // contas fixas: mensal | anual | parcelado
+  incomes: [], // rendas extras: unica | anual | parcelado (por um tempo) | mensal
+  limits: {},  // { categoria: valor máximo por mês }
+  paid: {},    // { 'AAAA-MM': { idDaConta: true } }
+  tx: [],      // lançamentos (gastos)
+  goals: [],   // planos
+  meta: {},    // datas de backup, resumo visto, checagem de atualização
 };
 let S = load();
 let PLAN = null; // cache do planejamento; zera a cada save()
@@ -110,6 +114,7 @@ function load() {
 function save() {
   PLAN = null;
   try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { toast('Não consegui salvar no aparelho.'); }
+  scheduleNotificationsSoon();
 }
 
 /* ---------- cartão de crédito ---------- */
@@ -126,9 +131,9 @@ function cardUsed() {
   const t = todayStr(); const cur = curM();
   const firstUnpaid = dayOf(t) <= +S.settings.cardDue ? cur : addM(cur, 1);
   const open = cardPayMonth(t);
-  let used = sum(S.tx.filter((x) => x.method === 'credito' && diffM(x.payMonth, firstUnpaid) >= 0));
+  let used = sum(S.tx.filter((x) => x.method === 'credito' && diffM(x.payMonth, firstUnpaid) >= 0), (x) => x.amount);
   for (let M = firstUnpaid; diffM(open, M) >= 0; M = addM(M, 1)) {
-    used += sum(S.fixed.filter((f) => f.method === 'credito' && occurs(f, M)), (f) => f.amount);
+    used += sum(fixedForMonth(M).filter((e) => e.f.method === 'credito'), (e) => e.f.amount);
   }
   return used;
 }
@@ -140,6 +145,7 @@ function daysToPayday() {
 
 /* ---------- contas fixas ---------- */
 function occurs(f, M) {
+  if (f.kind === 'unica') return M === f.start;
   if (f.start && diffM(M, f.start) < 0) return false;
   if (f.kind === 'parcelado') return diffM(M, f.start) < (+f.parcels || 1);
   if (f.kind === 'anual') {
@@ -158,24 +164,47 @@ function fixedInfo(f, M) {
 }
 const fixedEnd = (f) => (f.kind === 'parcelado' ? addM(f.start, (+f.parcels || 1) - 1) : null);
 
+/**
+ * Contas fixas que saem do bolso no mês M.
+ * Débito: no próprio mês. Cartão: no mês em que vence a fatura onde a cobrança cai
+ * (ex.: assinatura cobrada dia 20 com fechamento dia 3 entra na fatura do mês seguinte).
+ * Devolve [{ f, O }], onde O é o mês da cobrança original.
+ */
+function fixedForMonth(M) {
+  const out = [];
+  for (const f of S.fixed) {
+    if (f.method !== 'credito') { if (occurs(f, M)) out.push({ f, O: M }); continue; }
+    for (let k = 2; k >= 0; k--) {
+      const O = addM(M, -k);
+      if (occurs(f, O) && cardPayMonth(dateIn(O, +f.day || 1)) === M) out.push({ f, O });
+    }
+  }
+  return out.sort((a, b) => a.f.day - b.f.day);
+}
+const extrasForMonth = (M) => (S.incomes || []).filter((x) => occurs(x, M));
+
 /* ---------- números do mês ---------- */
 /** Números do mês sem considerar os planos. */
 function baseMonth(M) {
   const s = S.settings; const cur = curM();
-  const fx = S.fixed.filter((f) => occurs(f, M)).sort((a, b) => a.day - b.day);
+  const entries = fixedForMonth(M);
+  const fx = entries.map((e) => e.f);
   const fixedEss = sum(fx.filter((f) => isEss(f.cat)), (f) => f.amount);
   const fixedLaz = sum(fx.filter((f) => !isEss(f.cat)), (f) => f.amount);
   const txs = S.tx.filter((t) => t.payMonth === M && !t.linkedFixed);
   const varEss = sum(txs.filter((t) => isEss(t.cat)), (t) => t.amount);
   const varLaz = sum(txs.filter((t) => !isEss(t.cat)), (t) => t.amount);
-  const income = +s.income || 0;
-  const savings = income * (+s.savingsPct || 0) / 100;
+  const extras = extrasForMonth(M);
+  const extraIncome = sum(extras, (x) => x.amount);
+  const salary = +s.income || 0;
+  const income = salary + extraIncome;
+  const savings = salary * (+s.savingsPct || 0) / 100; // a renda extra fica livre para os planos
   // Mês atual e futuros: conta o orçamento de variáveis essenciais (mercado etc.) mesmo que ainda não gasto.
   const essPlanned = diffM(M, cur) >= 0 ? Math.max(+s.varEssBudget || 0, varEss) : varEss;
   const beforeSavings = income - fixedEss - fixedLaz - essPlanned;
   const card = sum(txs.filter((t) => t.method === 'credito'), (t) => t.amount)
     + sum(fx.filter((f) => f.method === 'credito'), (f) => f.amount);
-  return { M, income, fx, fixedEss, fixedLaz, varEss, varLaz, essPlanned, savings, beforeSavings, txs, card };
+  return { M, income, salary, extras, extraIncome, entries, fx, fixedEss, fixedLaz, varEss, varLaz, essPlanned, savings, beforeSavings, txs, card };
 }
 
 /**
@@ -234,7 +263,7 @@ function evalHits(hits) {
 }
 const worstOf = (rows) => rows.reduce((a, b) => (b.after < a.after ? b : a));
 
-function advise({ value, method, parcels, essential, balance }) {
+function advise({ value, method, parcels, essential, balance, cat }) {
   const s = S.settings; const today = todayStr(); const cur = curM();
   const rows = evalHits(makeHits(value, method, parcels));
   const worst = worstOf(rows);
@@ -295,6 +324,18 @@ function advise({ value, method, parcels, essential, balance }) {
     for (let i = 1; i <= 6; i++) {
       const M = addM(cur, i);
       if (monthSummary(M).restante >= value) { tips.push(`Se puder esperar até ${mFull(M)}, cabe à vista.`); break; }
+    }
+  }
+  const lim = +(S.limits || {})[cat] || 0;
+  if (lim > 0) {
+    const first = rows[0];
+    const spent = categorySpent(first.M, cat);
+    const after = spent + first.amt;
+    if (after > lim) {
+      if (level === 'ok') level = 'warn';
+      reasons.push(`Passa o limite de ${catName(cat)} em ${mFull(first.M)}: ${brl(after)} de ${brl(lim)}.`);
+    } else if (after > 0.8 * lim) {
+      tips.push(`Chega a ${pct(after / lim)} do limite de ${catName(cat)} em ${mFull(first.M)}.`);
     }
   }
   if (essential && level === 'bad') tips.push('Como é essencial: se não der para adiar, compense cortando lazer nos meses afetados.');
@@ -459,15 +500,39 @@ function renderHome() {
   const used = s.livreLazer > 0 ? Math.min(1, s.varLaz / s.livreLazer) : 1;
 
   const paidMap = S.paid[M] || {};
-  const bills = s.fx.map((f) => {
+  const bills = s.entries.map(({ f, O }) => {
     const paid = !!paidMap[f.id];
-    const late = isCur && !paid && f.day < dayOf(todayStr());
+    const card = f.method === 'credito';
+    const dueDay = card ? +S.settings.cardDue : f.day;
+    const late = isCur && !paid && dueDay < dayOf(todayStr());
+    const when = card ? `na fatura que vence ${fmtDate(cardDueDate(M))}` : `vence ${pad(Math.min(f.day, daysIn(M)))}/${M.slice(5)}`;
     return `<div class="row">
       <input type="checkbox" data-act="paid" data-id="${f.id}" ${paid ? 'checked' : ''} aria-label="Marcar ${esc(f.name)} como paga">
       <div class="grow"><div class="title">${esc(f.name)}</div>
-        <div class="small ${late ? 'neg' : 'muted'}">vence ${pad(Math.min(f.day, daysIn(M)))}/${M.slice(5)} · ${fixedInfo(f, M)}${late ? ' · atrasada' : ''}</div></div>
+        <div class="small ${late ? 'neg' : 'muted'}">${when} · ${fixedInfo(f, O)}${late ? ' · atrasada' : ''}</div></div>
       <div class="amt num">${brl(f.amount)}</div></div>`;
   }).join('') || '<div class="empty">Nenhuma conta fixa neste mês. Cadastre na aba Contas.</div>';
+
+  // Limites por categoria.
+  const lims = Object.entries(S.limits || {}).filter(([, v]) => +v > 0);
+  const limHtml = `<h2>Limites por categoria</h2><div class="card">${lims.map(([c, v]) => {
+    const spent = categorySpent(M, c); const p = spent / v;
+    const cls = p > 1 ? 'neg' : p >= 0.8 ? 'warn-t' : '';
+    return `<div style="padding:6px 0"><div class="row" style="padding:0;border:0"><div class="grow title">${esc(catName(c))}</div>
+      <div class="small num ${cls}">${brl(spent)} de ${brl(v)}</div></div>
+      <div class="pbar"><i style="width:${Math.min(100, Math.round(p * 100))}%;background:${p > 1 ? 'var(--bad)' : p >= 0.8 ? 'var(--warn)' : 'var(--brand)'}"></i></div></div>`;
+  }).join('') || '<div class="small muted">Defina um teto para restaurantes, compras, lazer…</div>'}
+    <button class="btn ghost sm" data-act="limits" style="margin-top:8px">${lims.length ? 'Editar limites' : 'Definir limites'}</button></div>`;
+
+  // Avisos de atualização, resumo do mês e backup.
+  const prev = addM(cur, -1);
+  const top = [];
+  if (UPDATE) top.push(`<div class="alert ok">Nova versão ${esc(UPDATE.version)} disponível. <button class="btn sm" data-act="do-update">Atualizar</button></div>`);
+  if (isCur && hasData(prev)) top.push(`<div class="alert ok">Resumo de ${mFull(prev)} pronto. <button class="btn sm ghost" data-act="summary" data-m="${prev}">Ver resumo</button></div>`);
+  const lastShare = S.meta?.lastShare ? daysBetween(S.meta.lastShare, todayStr()) : null;
+  if (NATIVE && S.settings.setupDone && (lastShare === null || lastShare > 30)) {
+    top.push(`<div class="alert">Seu último backup fora do celular ${lastShare === null ? 'nunca foi feito' : `foi há ${lastShare} dias`}. <button class="btn sm ghost" data-act="backup">Enviar ao Drive</button></div>`);
+  }
 
   // Contas anuais chegando: sugere guardar um pouco por mês.
   const upcoming = [];
@@ -487,7 +552,7 @@ function renderHome() {
     return `<div class="row"><div class="grow"><div class="title">${esc(g?.name)}</div></div><div class="amt num">${brl(v)}</div></div>`;
   }).join('')}</div>` : '';
 
-  return `${monthBar('month')}
+  return `${top.join('')}${monthBar('month')}
   ${alerts.map(([k, t]) => `<div class="alert ${k}">${t}</div>`).join('')}
   <div class="card hero">
     <div class="sub">Livre para lazer ${isCur ? 'até o fim do mês' : `em ${mFull(M)}`}</div>
@@ -496,7 +561,7 @@ function renderHome() {
     <div class="bar"><i style="width:${Math.round(used * 100)}%"></i></div>
   </div>
   <div class="grid2">
-    ${stat('Renda', brl(s.income))}
+    ${stat('Renda', brl(s.income), s.extraIncome ? `<div class="small muted">inclui ${brl(s.extraIncome)} extra</div>` : '')}
     ${stat('Fixos essenciais', brl(s.fixedEss))}
     ${stat('Fixos não essenciais', brl(s.fixedLaz))}
     ${stat('Variáveis essenciais', brl(s.varEss), `<div class="small muted">previsto ${brl(s.essPlanned)}</div>`)}
@@ -504,7 +569,48 @@ function renderHome() {
     ${stat('Fatura do cartão', brl(s.card), `<div class="small muted">vence ${fmtDate(cardDueDate(M))}</div>`)}
   </div>
   <h2>Contas do mês</h2><div class="card">${bills}</div>
-  ${planHtml}${upHtml}`;
+  ${limHtml}${planHtml}${upHtml}`;
+}
+
+/** Quanto foi gasto numa categoria no mês (lançamentos + contas fixas daquela categoria). */
+function categorySpent(M, cat) {
+  return sum(S.tx.filter((t) => t.payMonth === M && t.cat === cat && !t.linkedFixed), (t) => t.amount)
+    + sum(fixedForMonth(M).filter((e) => e.f.cat === cat), (e) => e.f.amount);
+}
+const hasData = (M) => S.tx.some((t) => t.payMonth === M && !t.projected);
+
+/* ---------- resumo do mês ---------- */
+function summaryHtml(M) {
+  const s = monthSummary(M); const p = baseMonth(addM(M, -1));
+  const byCat = {};
+  s.txs.forEach((t) => { byCat[t.cat] = (byCat[t.cat] || 0) + t.amount; });
+  s.fx.forEach((f) => { byCat[f.cat] = (byCat[f.cat] || 0) + (+f.amount); });
+  const prevCat = {};
+  p.txs.forEach((t) => { prevCat[t.cat] = (prevCat[t.cat] || 0) + t.amount; });
+  p.fx.forEach((f) => { prevCat[f.cat] = (prevCat[f.cat] || 0) + (+f.amount); });
+  const rows = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
+  const total = sum(rows, (r) => r[1]);
+  const prevTotal = sum(Object.values(prevCat));
+  const saved = sum(S.goals.flatMap((g) => g.history || []).filter((h) => ymOf(h.date) === M), (h) => h.v);
+  // Sugestão de corte: a categoria não essencial que mais cresceu.
+  const cut = rows.filter(([c]) => !isEss(c)).map(([c, v]) => [c, v - (prevCat[c] || 0), v]).sort((a, b) => b[1] - a[1])[0];
+  const over = Object.entries(S.limits || {}).filter(([c, v]) => +v > 0 && (byCat[c] || 0) > v);
+  return `<h3>Resumo de ${mFull(M)}</h3>
+  <div class="grid2">
+    ${stat('Gastos totais', brl(total), prevTotal ? `<div class="small ${total > prevTotal ? 'neg' : 'pos'}">${total > prevTotal ? '+' : ''}${brl(total - prevTotal)} vs mês anterior</div>` : '')}
+    ${stat('Sobrou livre', brl(s.restante))}
+    ${stat('Guardado nos planos', brl(saved))}
+    ${stat('Renda', brl(s.income))}
+  </div>
+  <div class="card">${rows.map(([c, v]) => {
+    const d = v - (prevCat[c] || 0);
+    return `<div class="row"><div class="grow"><div class="title">${esc(catName(c))}</div>
+      <div class="small ${d > 0 ? 'neg' : 'muted'}">${prevCat[c] ? `${d > 0 ? '+' : ''}${brl(d)} vs anterior` : 'novo'}</div></div>
+      <div class="amt num">${brl(v)}</div></div>`;
+  }).join('') || '<div class="empty">Sem gastos registrados.</div>'}</div>
+  ${over.length ? `<div class="alert bad">Passou do limite em: ${over.map(([c]) => esc(catName(c))).join(', ')}.</div>` : ''}
+  ${cut && cut[1] > 0 ? `<div class="alert">Onde dá para cortar: <b>${esc(catName(cut[0]))}</b> subiu ${brl(cut[1])}. Voltar ao nível do mês anterior libera esse valor para os planos.</div>` : ''}
+  <div class="btns"><button class="btn" data-act="close">Fechar</button></div>`;
 }
 
 /* ---------- Contas fixas ---------- */
@@ -526,10 +632,67 @@ function renderBills() {
     }).join('')}</div>`;
   };
   const s = monthSummary(cur);
+  const KIND_TXT = (x) => ({
+    unica: `em ${mFull(x.start)}`,
+    anual: `todo ano em ${MONTHS_FULL[(+x.month || 1) - 1]}${x.spread > 1 ? ` (${x.spread}x)` : ''}`,
+    parcelado: `${x.parcels} meses a partir de ${mLabel(x.start)}`,
+    mensal: 'todo mês',
+  }[x.kind]);
+  const incomes = (S.incomes || []).map((x) => `<div class="row" data-act="edit-income" data-id="${x.id}" style="cursor:pointer">
+    <div class="grow"><div class="title">${esc(x.name)}</div><div class="small muted">${KIND_TXT(x)}</div></div>
+    <div class="amt num pos">+${brl(x.amount)}</div></div>`).join('');
+  const incomeHtml = `<h2>Rendas extras</h2><div class="card">
+    ${incomes || '<div class="small muted">13º, férias, bônus, freelas… Entram na previsão no mês certo.</div>'}
+    <div class="btns" style="margin-top:8px">
+      <button class="btn ghost sm" data-act="new-income">+ Renda extra</button>
+      ${(S.incomes || []).some((x) => /13/.test(x.name)) ? '' : '<button class="chip" style="color:var(--brand)" data-act="new-income" data-tpl="13">13º salário</button>'}
+      <button class="chip" style="color:var(--brand)" data-act="new-income" data-tpl="ferias">Férias</button>
+    </div></div>`;
   return `<div class="fab-row"><button class="btn" data-act="new-bill">+ Nova conta fixa</button></div>
   <div class="grid2">${stat('Fixos neste mês', brl(s.fixedEss + s.fixedLaz))}${stat('Essenciais', brl(s.fixedEss))}</div>
   ${group('mensal', 'Mensais')}${group('anual', 'Anuais (IPVA, IPTU, seguro…)')}${group('parcelado', 'Parceladas e financiamentos')}
-  ${S.fixed.length ? '' : '<div class="empty">Cadastre aluguel, luz, internet, financiamento do carro, IPVA…<br>Isso é a base da previsão.</div>'}`;
+  ${S.fixed.length ? '' : '<div class="empty">Cadastre aluguel, luz, internet, financiamento do carro, IPVA…<br>Isso é a base da previsão.</div>'}
+  ${incomeHtml}`;
+}
+
+function incomeForm(x, tpl) {
+  const cur = curM(); const sal = +S.settings.income || 0;
+  if (!x) {
+    x = { kind: 'unica', start: cur, month: 12, spread: 1, parcels: 6, name: '', amount: '' };
+    if (tpl === '13') Object.assign(x, { name: '13º salário', kind: 'anual', month: 11, spread: 2, amount: r2(sal / 2) });
+    if (tpl === 'ferias') Object.assign(x, { name: 'Férias (1/3)', kind: 'unica', start: addM(cur, 1), amount: r2(sal / 3) });
+  }
+  const monthOpts = MONTHS_FULL.map((m, i) => `<option value="${i + 1}" ${+x.month === i + 1 ? 'selected' : ''}>${m}</option>`).join('');
+  const L = { unica: 'Uma vez', anual: 'Todo ano', parcelado: 'Por um tempo', mensal: 'Todo mês' };
+  return `<h3>${x.id ? 'Editar renda extra' : 'Nova renda extra'}</h3>
+  <form id="income-form" data-id="${x.id || ''}">
+    <label class="f">Nome<input name="name" required value="${esc(x.name)}" placeholder="Ex.: Bônus, freela"></label>
+    <label class="f">Valor (por vez)<input name="amount" inputmode="decimal" required value="${x.amount}" placeholder="0,00"></label>
+    <div class="seg" data-seg="kind">${Object.entries(L).map(([k, l]) => `<button type="button" data-v="${k}" class="${x.kind === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+    <div data-kind="unica" ${x.kind === 'unica' ? '' : 'hidden'}><label class="f">Mês<input name="startU" type="month" value="${x.start || cur}"></label></div>
+    <div data-kind="anual" ${x.kind === 'anual' ? '' : 'hidden'}><div class="f2">
+      <label class="f">Mês<select name="month">${monthOpts}</select></label>
+      <label class="f">Em quantas vezes<input name="spread" type="number" min="1" max="12" value="${x.spread || 1}"></label></div>
+      <p class="small muted">13º: novembro, em 2 vezes (metade em nov, metade em dez).</p></div>
+    <div data-kind="parcelado" ${x.kind === 'parcelado' ? '' : 'hidden'}><div class="f2">
+      <label class="f">A partir de<input name="startP" type="month" value="${x.start || cur}"></label>
+      <label class="f">Por quantos meses<input name="parcels" type="number" min="1" max="120" value="${x.parcels || 6}"></label></div></div>
+    <div class="btns">
+      <button class="btn" type="submit">Salvar</button>
+      <button class="btn ghost" type="button" data-act="close">Cancelar</button>
+      ${x.id ? '<button class="btn danger" type="button" data-act="del-income">Excluir</button>' : ''}
+    </div>
+  </form>`;
+}
+
+function limitsForm() {
+  const cur = curM();
+  return `<h3>Limites por categoria</h3>
+  <p class="small muted">Teto de gasto por mês. Deixe em branco para não ter limite. Entre parênteses, o gasto deste mês.</p>
+  <form id="limits-form">${Object.keys(CATS).map((c) => `<label class="f">${esc(catName(c))} <span class="muted">(${brl(categorySpent(cur, c))})</span>
+    <input name="${c}" inputmode="decimal" value="${(S.limits || {})[c] || ''}" placeholder="sem limite"></label>`).join('')}
+    <div class="btns"><button class="btn" type="submit">Salvar</button><button class="btn ghost" type="button" data-act="close">Cancelar</button></div>
+  </form>`;
 }
 
 function billForm(f) {
@@ -678,6 +841,16 @@ function renderPlans() {
     <label class="f">Fatia do lazer que pode ir para os planos: <b id="share-v">${st.lazerToPlans}%</b>
       <input type="range" min="0" max="100" step="5" value="${st.lazerToPlans}" data-act="share" style="padding:0;border:0"></label>
   </div>
+  <div class="card">
+    <h3>Conte seus planos</h3>
+    <form id="talk-form">
+      <label class="f">Escreva do seu jeito. Eu monto as metas.
+        <textarea class="f-area" name="text" placeholder="Ex.: Quero viajar para o Chile em julho de 2027, uns 10 mil. Também quero trocar de celular até março, 3.500, já tenho 500. E montar minha reserva de emergência."></textarea></label>
+      <button class="btn block" type="submit">Montar planos</button>
+      <p class="small muted" style="margin:6px 0 0">${S.settings.aiKey ? 'Usando o Claude (precisa de internet).' : 'Leitura feita no próprio celular. Para entender textos mais livres, cadastre uma chave da API do Claude em Configurações.'}</p>
+    </form>
+    <div id="talk-result"></div>
+  </div>
   <div class="fab-row"><button class="btn" data-act="new-goal">+ Novo plano</button></div>
   <div class="btns" style="margin-bottom:12px">
     ${['Reserva de emergência', 'Viagem', 'Trocar de carro', 'Quitar dívida', 'Entrada de imóvel'].map((t) => `<button class="chip" style="color:var(--brand)" data-act="new-goal" data-tpl="${t}">${t}</button>`).join('')}
@@ -718,6 +891,101 @@ function goalForm(g, tpl) {
   </form>`;
 }
 
+/* ---------- planos por conversa ---------- */
+const MONTH_RE = 'jan(?:eiro)?|fev(?:ereiro)?|mar(?:ço|co)?|abr(?:il)?|mai(?:o)?|jun(?:ho)?|jul(?:ho)?|ago(?:sto)?|set(?:embro)?|out(?:ubro)?|nov(?:embro)?|dez(?:embro)?';
+const monthIdx = (s) => ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez'].indexOf(s.slice(0, 3).toLowerCase().replace('ç', 'c'));
+
+/** Lê valores como "10 mil", "R$ 3.500", "2k", "1,5 mil". Devolve [valores na ordem]. */
+function readAmounts(t) {
+  const out = [];
+  const re = /(?:r\$\s*)?(\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d+(?:[.,]\d+)?)\s*(mil|k)?\b/gi;
+  let m;
+  while ((m = re.exec(t))) {
+    const before = t.slice(Math.max(0, m.index - 4), m.index).toLowerCase();
+    const after = t.slice(m.index + m[0].length, m.index + m[0].length + 12).toLowerCase();
+    if (/^\s*(de\s+)?(20\d\d)/.test(m[0]) || /^\s*(meses|mês|mes|anos?|x|vezes|dias)/.test(after) || /\/$/.test(before)) continue;
+    if (/^(20\d\d)$/.test(m[1])) continue;
+    // "3.500" é milhar em português, não 3,5.
+    let v = /^\d{1,3}(\.\d{3})+(,\d+)?$/.test(m[1]) ? money(m[1].replace(/\./g, '')) : money(m[1]);
+    if (m[2]) v *= 1000;
+    if (v >= 10) out.push({ v, i: m.index });
+  }
+  return out;
+}
+/** Prazo: "julho de 2027", "jul/27", "até março", "em 2 anos", "daqui 6 meses", "fim do ano". */
+function readDeadline(t) {
+  const cur = curM(); const low = t.toLowerCase();
+  let m = low.match(new RegExp(`(${MONTH_RE})\\s*(?:de|/)?\\s*(20\\d\\d|\\d\\d)\\b`));
+  if (m) { const y = m[2].length === 2 ? `20${m[2]}` : m[2]; return `${y}-${pad(monthIdx(m[1]) + 1)}`; }
+  m = low.match(/(?:em|daqui(?: a)?)\s*(\d+|um|uma|dois|duas|tr[eê]s)\s*(anos?|meses|m[eê]s)/);
+  if (m) {
+    const n = { um: 1, uma: 1, dois: 2, duas: 2, tres: 3, três: 3 }[m[1]] || +m[1];
+    return addM(cur, /ano/.test(m[2]) ? n * 12 : n);
+  }
+  m = low.match(new RegExp(`(?:at[eé]|em|para)\\s+(${MONTH_RE})\\b`));
+  if (m) { const mi = monthIdx(m[1]) + 1; let y = +cur.slice(0, 4); if (mi <= +cur.slice(5)) y++; return `${y}-${pad(mi)}`; }
+  m = low.match(/\b(20\d\d)\b/);
+  if (m) return `${m[1]}-12`;
+  if (/fim do ano|final do ano/.test(low)) return `${cur.slice(0, 4)}-12`;
+  return null;
+}
+function localParsePlans(text) {
+  const parts = text.split(/(?<!\d)\.(?!\d)|[;\n]+|\s+e\s+(?=(?:tamb[eé]m|quero|preciso|pretendo|vou|gostaria|meu|minha|fazer|comprar|trocar|juntar|guardar|montar|quitar|pagar|viajar))|\btamb[eé]m\b/i)
+    .map((p) => p.trim()).filter((p) => p.length > 3);
+  const plans = [];
+  for (const p of parts) {
+    const amts = readAmounts(p);
+    const savedM = p.match(/j[aá] (?:tenho|guardei|juntei)\s*(?:r\$\s*)?([\d.,]+\s*(?:mil|k)?)/i);
+    const saved = savedM ? readAmounts(savedM[1])[0]?.v || 0 : 0;
+    const target = amts.find((a) => !savedM || a.v !== saved)?.v || 0;
+    const reserva = /reserva|emerg[eê]ncia/i.test(p);
+    if (!target && !reserva) continue;
+    let name = p
+      .replace(/r\$\s*[\d.,]+\s*(mil|k)?/gi, '').replace(/\b\d[\d.,]*\s*(mil|k|reais)?\b/gi, '')
+      .replace(new RegExp(`\\b(em|at[eé]|para|de)?\\s*(${MONTH_RE})(\\s*(de|/)?\\s*(20)?\\d\\d)?\\b`, 'gi'), '')
+      .replace(/j[aá] (tenho|guardei|juntei).*/i, '')
+      .replace(/\b(eu\s+)?(quero|preciso|pretendo|vou|gostaria de|queria|tamb[eé]m|uns|umas|cerca de|mais ou menos|daqui( a)?|em \w+ (anos?|meses)|anos?|meses|at[eé]|custa|custando|que custa|no valor de)\b/gi, '')
+      .replace(/\b(se der|se sobrar|quando puder|sem pressa|urgente)\b/gi, '')
+      .replace(/\s+/g, ' ').replace(/^[\s,e-]+|[\s,-]+$/g, '')
+      .replace(/(\s+(de|do|da|em|at[eé]|para|por|no|na|com))+$/i, '').trim();
+    if (!name) name = reserva ? 'Reserva de emergência' : 'Plano';
+    name = name.charAt(0).toUpperCase() + name.slice(1);
+    let t = target;
+    if (reserva && !t) { const b = baseMonth(curM()); t = r2(6 * (b.fixedEss + Math.max(+S.settings.varEssBudget || 0, b.varEss))); }
+    const priority = reserva || /urgente|prioridade|d[ií]vida|quitar/i.test(p) ? 'alta' : /se der|se sobrar|quando puder|sem pressa/i.test(p) ? 'baixa' : 'media';
+    plans.push({ name: name.slice(0, 40), target: t, saved, deadline: readDeadline(p), priority });
+  }
+  return { plans, note: plans.length ? 'Confira os valores e prazos antes de adicionar.' : 'Não encontrei planos com valor. Tente: "viagem de 8 mil em julho de 2027".' };
+}
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    if (window.MeuBolsoAI) { res(); return; }
+    const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('Não consegui carregar o módulo de IA.'));
+    document.head.appendChild(s);
+  });
+}
+let talkDraft = null;
+async function runTalk(text) {
+  const box = $('#talk-result');
+  box.innerHTML = '<p class="small muted">Montando…</p>';
+  let res;
+  try {
+    if (S.settings.aiKey) {
+      await loadScript('vendor/ai.js');
+      res = await window.MeuBolsoAI.parsePlans(text, S.settings.aiKey, todayStr());
+    } else res = localParsePlans(text);
+  } catch (err) {
+    res = localParsePlans(text);
+    res.note = `${err.message} Usei a leitura do celular. ${res.note}`;
+  }
+  talkDraft = res.plans.map((p) => ({ ...p, id: uid(), saved: +p.saved || 0, target: r2(+p.target || 0) }));
+  box.innerHTML = `<p class="small">${esc(res.note)}</p>${talkDraft.map((p, i) => `<label class="row" style="cursor:pointer">
+    <input type="checkbox" data-talk="${i}" checked>
+    <div class="grow"><div class="title">${esc(p.name)}</div>
+      <div class="small muted">${brl(p.target)}${p.saved ? ` · já tem ${brl(p.saved)}` : ''} · ${p.deadline ? `até ${mFull(p.deadline)}` : 'sem prazo'} · prioridade ${PRI_LABEL[p.priority]}</div></div></label>`).join('')}
+    ${talkDraft.length ? '<button class="btn block" data-act="talk-add" style="margin-top:8px">Adicionar marcados</button>' : ''}`;
+}
+
 /* ---------- Previsão ---------- */
 function renderForecast() {
   const cur = curM(); const n = UI.horizon;
@@ -748,6 +1016,7 @@ function renderForecast() {
   // Destaques: contas anuais e parcelamentos que terminam.
   const notes = [];
   months.forEach((M) => S.fixed.filter((f) => f.kind === 'anual' && occurs(f, M)).forEach((f) => notes.push(['warn', `${mFull(M)}: ${esc(f.name)} +${brl(f.amount)}`])));
+  data.forEach((d) => d.extras.filter((x) => x.kind !== 'mensal').forEach((x) => notes.push(['ok', `${mFull(d.M)}: entra ${esc(x.name)} ${brl(x.amount)}`])));
   S.fixed.filter((f) => f.kind === 'parcelado').forEach((f) => {
     const end = fixedEnd(f);
     if (diffM(end, cur) >= 0) notes.push(['ok', `${esc(f.name)} termina em ${mFull(end)}: libera ${brl(f.amount)}/mês a partir de ${mFull(addM(end, 1))}.`]);
@@ -825,6 +1094,15 @@ function txForm() {
 /** Registra uma compra (com parcelas no cartão, cada parcela no mês da fatura). */
 function addPurchase({ desc, value, method, parcels, cat, date }) {
   date = date || todayStr();
+  const M0 = method === 'credito' ? cardPayMonth(date) : ymOf(date);
+  const lim = +(S.limits || {})[cat] || 0;
+  const before = lim ? categorySpent(M0, cat) : 0;
+  setTimeout(() => {
+    if (!lim) return;
+    const after = categorySpent(M0, cat);
+    if (after > lim && before <= lim) toast(`Atenção: passou o limite de ${catName(cat)} (${brl(after)} de ${brl(lim)}).`);
+    else if (after >= 0.8 * lim && before < 0.8 * lim) toast(`Você já usou ${pct(after / lim)} do limite de ${catName(cat)}.`);
+  }, 50);
   if (method === 'credito') {
     const first = cardPayMonth(date); const n = Math.max(1, parcels || 1); const each = r2(value / n);
     for (let i = 0; i < n; i++) {
@@ -857,6 +1135,11 @@ function settingsForm() {
     </div>
     <label class="f">Limite total do cartão (opcional)<input name="cardLimit" inputmode="decimal" value="${s.cardLimit || ''}" placeholder="0,00"></label>
     <p class="small muted">No app do Nubank: Cartão de crédito → Ajustes do cartão → Data de vencimento mostra o melhor dia de compra (fechamento).</p>
+    <h3 style="margin-top:8px">Celular</h3>
+    <label class="f" style="display:flex;gap:10px;align-items:center;color:var(--text)"><input type="checkbox" name="notify" ${s.notify ? 'checked' : ''}> Lembretes de vencimento, fatura e resumo do mês</label>
+    <label class="f" style="display:flex;gap:10px;align-items:center;color:var(--text)"><input type="checkbox" name="lock" ${s.lock ? 'checked' : ''}> Pedir digital ou PIN para abrir</label>
+    <label class="f">Chave da API do Claude (opcional, para "Conte seus planos")<input name="aiKey" type="password" autocomplete="off" value="${esc(s.aiKey || '')}" placeholder="sk-ant-…"></label>
+    <p class="small muted">A chave fica só neste celular. Cada uso custa centavos na sua conta da Anthropic. Sem chave, a leitura é feita no próprio celular.</p>
     <label class="f">Tema<select name="theme">
       ${[['auto', 'Automático'], ['light', 'Claro'], ['dark', 'Escuro']].map(([v, l]) => `<option value="${v}" ${s.theme === v ? 'selected' : ''}>${l}</option>`).join('')}
     </select></label>
@@ -864,11 +1147,15 @@ function settingsForm() {
   </form>
   ${s.setupDone ? `<h3 style="margin-top:18px">Seus dados</h3>
   <p class="small muted">Ficam só neste celular. Faça backup de vez em quando.</p>
+  ${NATIVE ? `<p class="small muted">Backup automático semanal em Documentos/MeuBolso: ${S.meta?.lastAutoBackup ? `último em ${fmtDate(S.meta.lastAutoBackup)}/${S.meta.lastAutoBackup.slice(0, 4)}` : 'ainda não feito'}.</p>` : ''}
   <div class="btns">
-    <button class="btn ghost sm" data-act="backup">Baixar backup</button>
+    <button class="btn ghost sm" data-act="backup">${NATIVE ? 'Enviar backup (Drive, WhatsApp…)' : 'Baixar backup'}</button>
     <button class="btn ghost sm" data-act="restore">Restaurar backup</button>
     <button class="btn danger sm" data-act="reset">Apagar tudo</button>
-  </div>` : ''}`;
+  </div>
+  ${NATIVE ? `<h3 style="margin-top:18px">Versão</h3>
+  <p class="small muted">Instalada: ${esc(APPVER?.versionName || '?')}${UPDATE ? ` · disponível: ${esc(UPDATE.version)}` : ''}</p>
+  <div class="btns"><button class="btn ghost sm" data-act="${UPDATE ? 'do-update' : 'check-update'}">${UPDATE ? 'Baixar e instalar atualização' : 'Verificar atualização'}</button></div>` : ''}` : ''}`;
 }
 function applyTheme() {
   const t = S.settings.theme;
@@ -898,7 +1185,9 @@ function saveDraft(form) {
 function restoreDraft(form) {
   const dr = form && readDrafts()[draftKey(form)];
   if (!dr) return;
+  $$('input[type=checkbox][name]', form).forEach((c) => { c.checked = c.name in dr.d; });
   for (const [k, v] of Object.entries(dr.d)) {
+    if (form.elements[k]?.type === 'checkbox') continue;
     if (k.startsWith('seg:')) { const btn = $(`[data-seg="${k.slice(4)}"] [data-v="${v}"]`, form); if (btn) setSeg(btn); continue; }
     const el = form.elements[k];
     if (el && el.type !== 'file') el.value = v;
@@ -926,6 +1215,8 @@ function reopenModal(ref) {
   else if (ref.k === 'bill') { const f = ref.id && S.fixed.find((x) => x.id === ref.id); if (!ref.id || f) openModal(billForm(f), ref); }
   else if (ref.k === 'goal') { const g = ref.id && S.goals.find((x) => x.id === ref.id); if (!ref.id || g) openModal(goalForm(g, ref.tpl), ref); }
   else if (ref.k === 'tx') openModal(txForm(), ref);
+  else if (ref.k === 'income') { const x = ref.id && S.incomes.find((y) => y.id === ref.id); if (!ref.id || x) openModal(incomeForm(x, ref.tpl), ref); }
+  else if (ref.k === 'limits') openModal(limitsForm(), ref);
 }
 function toast(msg) {
   const el = document.createElement('div');
@@ -995,6 +1286,28 @@ document.addEventListener('click', (e) => {
       break;
     }
     case 'new-tx': openModal(txForm(), { k: 'tx' }); break;
+    case 'new-income': openModal(incomeForm(null, el.dataset.tpl), { k: 'income', tpl: el.dataset.tpl }); break;
+    case 'edit-income': openModal(incomeForm(S.incomes.find((x) => x.id === id)), { k: 'income', id }); break;
+    case 'del-income': {
+      const iid = $('#income-form').dataset.id;
+      if (confirm('Excluir esta renda extra?')) { S.incomes = S.incomes.filter((x) => x.id !== iid); save(); closeModal(); render(); }
+      break;
+    }
+    case 'limits': openModal(limitsForm(), { k: 'limits' }); break;
+    case 'summary': {
+      openModal(summaryHtml(el.dataset.m));
+      S.meta = { ...(S.meta || {}), lastSummary: el.dataset.m }; save();
+      break;
+    }
+    case 'talk-add': {
+      const picked = $$('[data-talk]').filter((c) => c.checked).map((c) => talkDraft[+c.dataset.talk]);
+      picked.forEach((p) => S.goals.push({ id: uid(), name: p.name, target: p.target, saved: p.saved, deadline: p.deadline, priority: p.priority, history: [] }));
+      talkDraft = null; clearDraft($('#talk-form')); save(); render();
+      toast(`${picked.length} plano(s) adicionados. Veja abaixo quanto guardar por mês.`);
+      break;
+    }
+    case 'check-update': checkUpdate(true); break;
+    case 'do-update': doUpdate(); break;
     case 'del-tx': if (confirm('Excluir este lançamento?')) { S.tx = S.tx.filter((t) => t.id !== id); save(); render(); } break;
     case 'import': $('#file-import').click(); break;
     case 'confirm-import': {
@@ -1032,7 +1345,7 @@ document.addEventListener('input', (e) => {
   if (e.target.form?.id) saveDraft(e.target.form);
 });
 
-document.addEventListener('submit', (e) => {
+document.addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target; const d = formData(form);
   if (form.id !== 'adv-form') clearDraft(form); // salvo de verdade: o rascunho não é mais necessário
@@ -1042,8 +1355,39 @@ document.addEventListener('submit', (e) => {
       Object.assign(s, {
         income: money(d.income), payDay: +d.payDay || 1, savingsPct: +d.savingsPct || 0, varEssBudget: money(d.varEssBudget),
         cardClose: +d.cardClose || 1, cardDue: +d.cardDue || 1, cardLimit: money(d.cardLimit), theme: d.theme, setupDone: true,
+        notify: d.notify === 'on', aiKey: (d.aiKey || '').trim(),
       });
+      const wantLock = d.lock === 'on';
+      if (wantLock && !s.lock) {
+        const ok = await enableLock();
+        s.lock = ok;
+      } else s.lock = wantLock;
       save(); applyTheme(); closeModal(); render(); toast('Configurações salvas.');
+      if (s.notify) ensureNotifyPermission();
+      break;
+    }
+    case 'income-form': {
+      const kind = segValue(form, 'kind') || 'unica';
+      const x = { id: form.dataset.id || uid(), name: d.name.trim(), amount: r2(money(d.amount)), kind };
+      if (kind === 'unica') x.start = d.startU || curM();
+      if (kind === 'anual') { x.month = +d.month; x.spread = Math.max(1, +d.spread || 1); x.start = '2000-01'; }
+      if (kind === 'parcelado') { x.start = d.startP || curM(); x.parcels = Math.max(1, +d.parcels || 1); }
+      if (kind === 'mensal') x.start = curM();
+      S.incomes = S.incomes || [];
+      const i = S.incomes.findIndex((y) => y.id === x.id);
+      if (i >= 0) S.incomes[i] = x; else S.incomes.push(x);
+      save(); closeModal(); render(); toast('Renda extra salva.');
+      break;
+    }
+    case 'limits-form': {
+      S.limits = {};
+      for (const [c, v] of Object.entries(d)) { const n = money(v); if (n > 0) S.limits[c] = r2(n); }
+      save(); closeModal(); render(); toast('Limites salvos.');
+      break;
+    }
+    case 'talk-form': {
+      if (!d.text.trim()) { toast('Escreva seus planos.'); break; }
+      runTalk(d.text.trim());
       break;
     }
     case 'bill-form': {
@@ -1072,7 +1416,9 @@ document.addEventListener('submit', (e) => {
     }
     case 'dep-form': {
       const g = S.goals.find((x) => x.id === form.dataset.id);
-      g.saved = r2((+g.saved || 0) + money(d.v)); save(); closeModal(); render();
+      g.saved = r2((+g.saved || 0) + money(d.v));
+      g.history = [...(g.history || []), { date: todayStr(), v: r2(money(d.v)) }];
+      save(); closeModal(); render();
       toast(g.saved >= g.target ? `Plano "${g.name}" concluído!` : 'Valor guardado.');
       break;
     }
@@ -1090,7 +1436,7 @@ document.addEventListener('submit', (e) => {
       });
       if (a.method === 'debito') a.parcels = 1;
       if (!(a.value > 0)) { toast('Informe o valor.'); break; }
-      const r = advise({ value: a.value, method: a.method, parcels: a.parcels, essential: a.essential, balance: a.balance ?? null });
+      const r = advise({ value: a.value, method: a.method, parcels: a.parcels, essential: a.essential, balance: a.balance ?? null, cat: a.cat });
       a.result = adviceHtml(r, a);
       $('#adv-result').innerHTML = a.result;
       $('#adv-result').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1150,6 +1496,7 @@ async function exportBackup() {
     try {
       const { uri } = await P.Filesystem.writeFile({ path: name, data: json, directory: 'CACHE', encoding: 'utf8' });
       await P.Share.share({ title: 'Backup Meu Bolso', files: [uri] });
+      S.meta = { ...(S.meta || {}), lastShare: todayStr() }; save(); render();
       return;
     } catch (err) {
       if (/cancel/i.test(String(err?.message))) return;
@@ -1160,6 +1507,154 @@ async function exportBackup() {
   const blob = new Blob([json], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  S.meta = { ...(S.meta || {}), lastShare: todayStr() }; save();
+}
+
+/** Backup automático: 1x por semana grava em Documentos/MeuBolso (sobrevive à desinstalação do app). */
+async function autoBackup(force = false) {
+  const P = window.Capacitor?.Plugins || {};
+  if (!NATIVE || !P.Filesystem) return;
+  const last = S.meta?.lastAutoBackup;
+  if (!force && last && daysBetween(last, todayStr()) < 7) return;
+  const json = JSON.stringify(S, null, 2);
+  const files = ['MeuBolso/meu-bolso-backup.json', `MeuBolso/meu-bolso-${curM()}.json`];
+  for (const directory of ['DOCUMENTS', 'EXTERNAL']) {
+    try {
+      for (const path of files) await P.Filesystem.writeFile({ path, data: json, directory, encoding: 'utf8', recursive: true });
+      S.meta = { ...(S.meta || {}), lastAutoBackup: todayStr(), backupDir: directory };
+      try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { /* ok */ }
+      return;
+    } catch { /* tenta a próxima pasta */ }
+  }
+}
+
+/* ---------- lembretes (notificações) ---------- */
+let notifTimer = null;
+function scheduleNotificationsSoon() {
+  clearTimeout(notifTimer);
+  notifTimer = setTimeout(scheduleNotifications, 1500);
+}
+async function ensureNotifyPermission() {
+  const LN = window.Capacitor?.Plugins?.LocalNotifications;
+  if (!NATIVE || !LN) return false;
+  try {
+    let p = await LN.checkPermissions();
+    if (p.display !== 'granted') p = await LN.requestPermissions();
+    return p.display === 'granted';
+  } catch { return false; }
+}
+/** Reagenda todos os lembretes dos próximos ~45 dias a partir dos dados atuais. */
+async function scheduleNotifications() {
+  const LN = window.Capacitor?.Plugins?.LocalNotifications;
+  if (!NATIVE || !LN) return;
+  try {
+    const pending = await LN.getPending();
+    if (pending.notifications?.length) await LN.cancel({ notifications: pending.notifications.map((n) => ({ id: n.id })) });
+    if (!S.settings.notify || !S.settings.setupDone) return;
+    if ((await LN.checkPermissions()).display !== 'granted') return;
+
+    const now = Date.now(); const limit = now + 45 * 864e5;
+    const list = []; let id = 1;
+    const at = (ds, h = 9) => { const [y, m, d] = ds.split('-').map(Number); return new Date(y, m - 1, d, h, 0, 0); };
+    const add = (date, title, body) => { if (date.getTime() > now && date.getTime() < limit) list.push({ id: id++, title, body, schedule: { at: date } }); };
+    const st = S.settings; const cur = curM();
+
+    for (let i = 0; i < 3; i++) {
+      const M = addM(cur, i); const paid = S.paid[M] || {};
+      // Contas no débito/boleto: 2 dias antes e no dia.
+      for (const { f } of fixedForMonth(M)) {
+        if (f.method === 'credito' || paid[f.id]) continue;
+        const due = dateIn(M, f.day);
+        const d2 = new Date(at(due).getTime() - 2 * 864e5);
+        add(d2, `${f.name} vence em 2 dias`, `${brl(f.amount)} no dia ${fmtDate(due)}.`);
+        add(at(due), `Hoje vence: ${f.name}`, `${brl(f.amount)}. Depois de pagar, marque como paga no app.`);
+      }
+      // Fatura do cartão: 2 dias antes.
+      const card = baseMonth(M).card;
+      if (card > 0) {
+        const due = cardDueDate(M);
+        add(new Date(at(due).getTime() - 2 * 864e5), 'Fatura do cartão vence em 2 dias', `Previsto: ${brl(card)} em ${fmtDate(due)}.`);
+      }
+      // Melhor dia de compra e lembrete de importar a fatura fechada.
+      const close = dateIn(M, +st.cardClose);
+      add(at(close), 'Melhor dia de compra no cartão', 'A fatura fechou: compras de hoje só serão pagas no próximo vencimento.');
+      add(at(close, 19), 'Importe a fatura do Nubank', 'Exporte o CSV da fatura que fechou e importe em Gastos → Importar Nubank.');
+      // Resumo do mês no dia 1.
+      if (i > 0) add(at(`${M}-01`), `Resumo de ${mFull(addM(M, -1))}`, 'Veja quanto gastou por categoria e onde dá para cortar.');
+      // Contas anuais 7 dias antes.
+      S.fixed.filter((f) => f.kind === 'anual' && occurs(f, M) && !occurs(f, addM(M, -1))).forEach((f) => {
+        const due = dateIn(M, f.day);
+        add(new Date(at(due).getTime() - 7 * 864e5), `${f.name} vence em 7 dias`, `${brl(f.amount * Math.max(1, +f.spread || 1))} em ${fmtDate(due)}.`);
+      });
+    }
+    if (list.length) await LN.schedule({ notifications: list.slice(0, 60) });
+  } catch { /* lembretes são um extra: falha silenciosa */ }
+}
+
+/* ---------- bloqueio com digital ---------- */
+const MB = () => window.Capacitor?.Plugins?.MeuBolso;
+let hiddenAt = 0;
+async function enableLock() {
+  if (!NATIVE || !MB()) { toast('O bloqueio só funciona no app Android.'); return false; }
+  const { available } = await MB().canLock();
+  if (!available) { toast('Configure digital ou PIN de tela no celular primeiro.'); return false; }
+  const { ok } = await MB().authenticate();
+  if (!ok) toast('Bloqueio não ativado.');
+  return ok;
+}
+async function showLock() {
+  if (!NATIVE || !S.settings.lock || !MB() || $('.lock')) return;
+  const el = document.createElement('div');
+  el.className = 'lock';
+  el.innerHTML = '<div style="font-size:22px;font-weight:800">Meu Bolso</div><div>Bloqueado</div><button class="btn">Desbloquear</button>';
+  document.body.appendChild(el);
+  const tryUnlock = async () => { const { ok } = await MB().authenticate(); if (ok) el.remove(); };
+  el.querySelector('button').addEventListener('click', tryUnlock);
+  tryUnlock();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  if (hiddenAt && Date.now() - hiddenAt > 60000) showLock();
+  if (hiddenAt && Date.now() - hiddenAt > 3600000) { render(); scheduleNotificationsSoon(); }
+});
+
+/* ---------- atualização dentro do app ---------- */
+const REPO = 'JoaoVbruno/meu-bolso';
+let UPDATE = null; // { version, code, url }
+let APPVER = null; // { versionName, versionCode }
+async function checkUpdate(manual = false) {
+  if (!NATIVE || !MB()) return;
+  try {
+    APPVER = APPVER || await MB().getVersion();
+    if (!manual && S.meta?.lastUpdateCheck === todayStr()) { if (S.meta.update && S.meta.update.code > APPVER.versionCode) { UPDATE = S.meta.update; render(); } return; }
+    const r = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const rel = await r.json();
+    const code = +(String(rel.tag_name).match(/(\d+)$/) || [])[1] || 0;
+    const asset = (rel.assets || []).find((a) => /\.apk$/i.test(a.name));
+    S.meta = { ...(S.meta || {}), lastUpdateCheck: todayStr() };
+    if (asset && code > APPVER.versionCode) {
+      UPDATE = { version: String(rel.tag_name).replace(/^v/, ''), code, url: asset.browser_download_url };
+      S.meta.update = UPDATE;
+    } else { UPDATE = null; delete S.meta.update; if (manual) toast('Você já está na versão mais nova.'); }
+    try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { /* ok */ }
+    if (UPDATE || manual) { render(); if (modal().open && modalRef?.k === 'settings') openModal(settingsForm(), modalRef); }
+  } catch { if (manual) toast('Não consegui verificar agora. Confira a internet.'); }
+}
+async function doUpdate() {
+  if (!UPDATE || !MB()) return;
+  await autoBackup(true); // garante uma cópia antes de trocar a versão
+  const sub = await MB().addListener('updateProgress', (e) => toastOnce(`Baixando atualização… ${e.percent}%`));
+  try {
+    const { status } = await MB().installUpdate({ url: UPDATE.url });
+    if (status === 'needs-permission') toast('Permita "Instalar apps desconhecidos" para o Meu Bolso, volte e toque em Atualizar de novo.');
+  } catch (err) { toast(err?.message || 'Falha ao baixar a atualização.'); }
+  finally { sub?.remove?.(); }
+}
+let toastEl = null;
+function toastOnce(msg) {
+  if (!toastEl) { toast(msg); toastEl = document.body.lastElementChild; setTimeout(() => { toastEl = null; }, 2500); }
+  else toastEl.textContent = msg;
 }
 
 /* ---------- instalação (PWA) ---------- */
@@ -1184,4 +1679,18 @@ else {
   // Reabre o último formulário que ficou pela metade.
   const last = Object.values(readDrafts()).filter((x) => x.reopen).sort((a, b) => b.at - a.at)[0];
   if (last) { reopenModal(last.reopen); toast('Recuperei o que você estava preenchendo.'); }
+  else {
+    // No começo do mês, abre o resumo do mês anterior uma vez.
+    const prev = addM(curM(), -1);
+    if (hasData(prev) && S.meta?.lastSummary !== prev) {
+      openModal(summaryHtml(prev));
+      S.meta = { ...(S.meta || {}), lastSummary: prev }; save();
+    }
+  }
+}
+if (NATIVE) {
+  showLock();
+  autoBackup();
+  ensureNotifyPermission().then(() => scheduleNotifications());
+  checkUpdate(false);
 }

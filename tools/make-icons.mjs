@@ -25,9 +25,9 @@ const chunk = (type, data) => {
   return Buffer.concat([len, td, crc]);
 };
 
-function icon(size, { maskable, noBg = false, onlyBg = false }) {
+function icon(size, { maskable, noBg = false, onlyBg = false, mono = false }) {
   const px = Buffer.alloc(size * size * 4);
-  const bg = [15, 118, 110], fg = [255, 255, 255], accent = [250, 204, 21];
+  const bg = [15, 118, 110], fg = [255, 255, 255], accent = mono ? fg : [250, 204, 21];
   const r = maskable ? 0 : size * 0.22; // cantos arredondados só no ícone normal
   const inRounded = (x, y) => {
     const cx = Math.min(Math.max(x, r), size - r), cy = Math.min(Math.max(y, r), size - r);
@@ -77,6 +77,10 @@ if (process.argv.includes('--android')) {
     writeFileSync(join(dir, 'ic_launcher_round.png'), icon(Math.round(48 * k), { maskable: false }));
     // Ícone adaptativo: camada da frente sem fundo, 108dp.
     writeFileSync(join(dir, 'ic_launcher_foreground.png'), icon(Math.round(108 * k), { maskable: true, noBg: true }));
+    // Ícone pequeno das notificações: só branco sobre transparente, 24dp.
+    const ddir = join(res, `drawable-${d}`);
+    mkdirSync(ddir, { recursive: true });
+    writeFileSync(join(ddir, 'ic_stat_meubolso.png'), icon(Math.round(24 * k), { maskable: true, noBg: true, mono: true }));
   }
   mkdirSync(join(res, 'values'), { recursive: true });
   writeFileSync(join(res, 'values/ic_launcher_background.xml'),

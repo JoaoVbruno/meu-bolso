@@ -118,6 +118,10 @@ ul.tips li { margin: 4px 0; }
 .alert.bad { border-color: var(--bad); background: var(--bad-bg); }
 .alert.ok { border-color: var(--ok); background: var(--ok-bg); }
 .neg { color: var(--bad); }
+.warn-t { color: var(--warn); }
+textarea.f-area { display: block; width: 100%; min-height: 110px; margin-top: 4px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--text); font: inherit; font-size: 16px; resize: vertical; }
+.lock { position: fixed; inset: 0; z-index: 100; background: var(--brand); color: var(--brand-ink); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; text-align: center; padding: 24px; }
+.lock .btn { background: var(--brand-ink); color: var(--brand); }
 .pos { color: var(--ok); }
 
 table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
